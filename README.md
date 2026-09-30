@@ -1,4 +1,6 @@
 # 小柯 AI 聊天機器人（OpenAI 版）— AI 聊天機器人組合套件 ESP32-S3 N16R8
+<img width="608" height="507" alt="image" src="https://github.com/user-attachments/assets/ed6b05c6-da62-4316-bba7-63962e7409be" />
+<img width="1477" height="1108" alt="image" src="https://github.com/user-attachments/assets/8af6c2c5-f7db-4135-867d-3219753b5bad" />
 
 把套件原廠的「小智」韌體換成 **小柯 OpenAI 版**：直接說話 → OpenAI 語音轉文字 → GPT 回答 → OpenAI TTS 從 3W 喇叭講出來；1.54 吋螢幕顯示可愛表情、時鐘、農曆和對話文字。
 
