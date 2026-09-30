@@ -25,8 +25,14 @@
 // ------------------------------------------------------------- 功能開關 ----
 #define HW_TEST_MODE    0          // 1 = 開機只跑硬體測試（螢幕/喇叭/麥克風/按鍵），先確認接線用
 
+// ------------------------------------------------------------ 唱歌（YouTube 歌單）----
+// 說「唱首歌」會從這個播放清單隨機選一首，顯示封面、歌名與 QR 碼（手機掃描在 YouTube 播放）
+#define YT_PLAYLIST_URL   "https://www.youtube.com/playlist?list=PLMiXt5EIkXI0"
+#define SONG_COMPOSER     "吳玉柱"   // 詞曲創作者（版權所有）
+#define SONG_SHOW_SEC     180        // 唱歌畫面停留秒數（按鍵可提早回到聊天）
+
 // ------------------------------------------------------------ 聲控（免按鍵）----
-#define VOICE_ACTIVATION  1        // 1 = 直接說話就會開始聆聽；0 = 按住 BOOT 鍵說話
+#define VOICE_ACTIVATION  1        // 1 = 直接說話就會開始聆聽；0 = 只用按鍵（按住 BOOT 說話）
 #define VAD_MIN_RMS       250      // 觸發錄音的最低音量（環境吵、常誤觸就調高；喊很大聲才有反應就調低）
 #define VAD_RATIO         3.0      // 音量需高於背景噪音幾倍才觸發
 #define VAD_SILENCE_MS    900      // 停頓多久視為說完

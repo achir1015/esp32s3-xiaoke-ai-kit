@@ -22,6 +22,8 @@
 #include <time.h>
 #include <vector>
 #include <initializer_list>
+#include "img_converters.h"
+#include "qrcode.h"
 #if __has_include("config.h")
 #include "config.h"          // 自己的設定（不上傳 GitHub）
 #else
@@ -162,7 +164,7 @@ class CjkText {
 CjkText u8f;
 
 // ---------------------------------------------------------------- UI 狀態 ----
-enum UiState { UI_IDLE, UI_LISTEN, UI_THINK, UI_SPEAK, UI_MSG, UI_HELP };
+enum UiState { UI_IDLE, UI_LISTEN, UI_THINK, UI_SPEAK, UI_MSG, UI_HELP, UI_SONG };
 volatile UiState uiState = UI_IDLE;
 String uiTitle, uiText;
 uint32_t uiSince = 0;
@@ -171,6 +173,15 @@ SemaphoreHandle_t uiLock = nullptr;
 volatile int micLevel = 0;         // 目前麥克風音量（給 UI 顯示）
 volatile int speakLevel = 0;       // 目前播放音量（嘴巴開合）
 volatile uint32_t lastInteraction = 0;
+
+// ---- 唱歌：YouTube 歌單 ----
+struct Song { String id, title; };
+std::vector<Song> songs;
+SemaphoreHandle_t songLock = nullptr;
+uint16_t *thumbPix = nullptr;      // 歌曲封面 320x180 RGB565（PSRAM）
+volatile bool thumbOk = false;
+uint8_t qrMods[45 * 45];           // QR 碼模組（最多 version 7 = 45x45）
+volatile int qrSize = 0;
 
 void setUi(UiState s, const String &title = "", const String &text = "", bool sad = false) {
   xSemaphoreTake(uiLock, portMAX_DELAY);
@@ -202,6 +213,16 @@ const size_t MAX_SAMPLES = MIC_SAMPLE_RATE * MAX_RECORD_SEC;
 int16_t preroll[PREROLL_FR][FRAME];
 int prerollHead = 0, prerollCount = 0;
 float noiseFloor = 150;
+float lastRecAvgRms = 0;           // 上一段錄音的平均音量
+bool lastRecHitMax = false;        // 上一段錄音是否一路沒停頓錄到上限（多半是音樂/噪音）
+const float NOISE_FLOOR_MAX = 3000;
+
+// 聽到的是噪音或音樂：把門檻提高到這個音量，避免同樣的聲音一直觸發（安靜後會自動降回）
+void raiseNoiseFloor(float level) {
+  float nf = min(NOISE_FLOOR_MAX, max(noiseFloor, level));
+  if (nf > noiseFloor) Serial.printf("（噪音 %.0f → 門檻提高到 %d）\n", level, (int)(nf * VAD_RATIO));
+  noiseFloor = nf;
+}
 int32_t dcState = 0;
 
 // ------------------------------------------------------------------ 其它 ----
@@ -211,7 +232,7 @@ int histCount = 0;
 const char *OPENAI_HOST = "https://api.openai.com";
 
 // ---- 可由網頁修改的設定（存在 NVS；沒存過就用 config.h 的值）----
-struct Settings { String ssid, pass, apiKey; } cfg;
+struct Settings { String ssid, pass, apiKey, playlist; } cfg;
 Preferences prefs;
 WebServer server(80);
 DNSServer dnsServer;
@@ -228,6 +249,7 @@ void loadSettings() {
   cfg.ssid   = prefs.isKey("ssid")   ? prefs.getString("ssid")   : cleanDefault(WIFI_SSID, "你的WiFi");
   cfg.pass   = prefs.isKey("pass")   ? prefs.getString("pass")   : cleanDefault(WIFI_PASSWORD, "你的WiFi");
   cfg.apiKey = prefs.isKey("apikey") ? prefs.getString("apikey") : cleanDefault(OPENAI_API_KEY, "請填入");
+  cfg.playlist = prefs.isKey("playlist") ? prefs.getString("playlist") : String(YT_PLAYLIST_URL);
   prefs.end();
 }
 String authHeader() { return "Bearer " + cfg.apiKey; }
@@ -454,7 +476,8 @@ void buildHelp() {
     {"5. 時間：上方顯示日期、星期、農曆與時間，也可以問「今天農曆幾號」。", C_WHITE},
     {"6. 網頁設定：開啟螢幕左下角的網址，可修改 Wi-Fi、密碼與 API Key。", C_WHITE},
     {"7. 連不上 Wi-Fi 時會開熱點 XiaoKe-Setup（密碼 xiaoke123），手機連上後開 192.168.4.1 設定。", C_WHITE},
-    {"8. 喚醒鍵（BOOT）：瀏覽本說明，看完最後一頁就回到聊天。", C_WHITE},
+    {"8. 唱歌：說「唱首歌」，從" SONG_COMPOSER "的 YouTube 創作歌單隨機選一首，手機掃 QR 碼就能播放。", C_WHITE},
+    {"9. 喚醒鍵（BOOT）：短按看本說明（看完最後一頁回到聊天）；環境吵雜時「按住說話，放開送出」。", C_WHITE},
     {"\f", 0},
     {"二、創意開發者", C_YELLOW},
     {"", C_WHITE},
@@ -499,6 +522,64 @@ void drawHelp(uint32_t now) {
   const char *foot = last ? "按鍵：回到聊天" : "按鍵：下一頁";
   u8f.setForegroundColor(C_GREEN);
   u8f.drawUTF8((SCREEN_W - u8f.getUTF8Width(foot)) / 2, 236, foot);
+}
+
+// ---- 唱歌畫面（240x240：左邊封面與歌名，右邊大 QR 碼方便手機掃描）----
+void drawNote(int x, int y, uint16_t c) {        // 八分音符
+  cv->fillCircle(x, y, 4, c);
+  cv->drawFastVLine(x + 3, y - 14, 14, c);
+  cv->drawFastVLine(x + 4, y - 14, 14, c);
+  cv->drawLine(x + 4, y - 14, x + 9, y - 9, c);
+  cv->drawLine(x + 4, y - 13, x + 9, y - 8, c);
+}
+
+void drawSong(const String &title, uint32_t now) {
+  // 封面（320x180 縮成 114x64）
+  const int TX = 4, TY = 41, TW = 114, TH = 64;
+  uint16_t *dst = cv->getBuffer();
+  if (thumbOk) {
+    for (int y = 0; y < TH; y++)
+      for (int x = 0; x < TW; x++)
+        dst[(TY + y) * SCREEN_W + TX + x] = thumbPix[(y * 180 / TH) * 320 + x * 320 / TW];
+  } else {
+    cv->fillRect(TX, TY, TW, TH, C_VISOR);
+    for (int i = 0; i < 3; i++) drawNote(TX + 34 + i * 20, TY + 40 - (i % 2) * 10, C_GLOW);
+  }
+  cv->drawRect(TX - 1, TY - 1, TW + 2, TH + 2, C_HELMET);
+
+  // QR 碼（白底黑點，四周留白）
+  const int QX = 122, QY = 40, QW = 114;
+  cv->fillRect(QX, QY, QW, QW, C_WHITE);
+  int n = qrSize;
+  if (n > 0) {
+    int m = QW / (n + 4), off = (QW - m * n) / 2;
+    for (int y = 0; y < n; y++)
+      for (int x = 0; x < n; x++)
+        if (qrMods[y * n + x]) cv->fillRect(QX + off + x * m, QY + off + y * m, m, m, C_BLACK);
+  }
+  u8f.setForegroundColor(C_GRAY);
+  const char *scan = "手機掃描 YouTube";
+  u8f.drawUTF8(QX + (QW - u8f.getUTF8Width(scan)) / 2, QY + QW + 17, scan);
+
+  // 歌名與創作者
+  u8f.setForegroundColor(C_ORANGE);
+  u8f.drawUTF8(4, 124, "正在唱：");
+  std::vector<String> lines = u8f.wrap("《" + title + "》", TW + 2);
+  u8f.setForegroundColor(C_WHITE);
+  for (size_t i = 0; i < lines.size() && i < 2; i++) u8f.drawUTF8(4, 142 + i * 17, lines[i].c_str());
+  u8f.setForegroundColor(C_GLOW_DIM);
+  u8f.drawUTF8(4, lines.size() > 1 ? 194 : 177, "詞曲：" SONG_COMPOSER);
+
+  // 唱歌的小柯 + 飄動音符
+  float beat = (sinf(now / 160.0f) + 1) / 2;
+  float mouth = speakLevel > 0 ? constrain(speakLevel / 6000.0f, 0.0f, 1.0f) : beat;
+  drawRobot(SCREEN_W - 30, 214, 0.18f, EX_HAPPY, 0, 0, false, mouth, now, C_ORANGE, false);
+  for (int i = 0; i < 3; i++) {
+    int ph = (now / 25 + i * 40) % 120;
+    drawNote(SCREEN_W - 80 + i * 12 - ph / 12, 222 - ph / 5, i == 1 ? C_PINK : C_GLOW);
+  }
+  u8f.setForegroundColor(C_GREEN);
+  u8f.drawUTF8(4, 236, "按鍵：回到聊天");
 }
 
 // ---- 農曆 ----
@@ -636,6 +717,14 @@ void uiTask(void *) {
     }
     float mouth = st == UI_SPEAK ? constrain(speakLevel / 6000.0f, 0.0f, 1.0f) : 0;
 
+    if (st == UI_SONG) {
+      cv->fillScreen(C_BG);
+      drawSong(title, now);
+      drawTopBar();
+      tft.drawRGBBitmap(0, 0, cv->getBuffer(), SCREEN_W, SCREEN_H);
+      vTaskDelay(pdMS_TO_TICKS(30));
+      continue;
+    }
     if (st == UI_HELP && helpPages.size()) {
       cv->fillScreen(C_BG);
       drawTopBar();
@@ -731,19 +820,24 @@ size_t recordUtterance(bool byButton) {
   lastInteraction = millis();
   int thr = vadThreshold();
   int silentMs = 0, voicedMs = 0;
+  double rmsSum = 0; int frames = 0;
+  lastRecHitMax = true;
   while (n + FRAME <= MAX_SAMPLES) {
     int rms = readFrame(pcm + n);
     n += FRAME;
     micLevel = rms;
+    rmsSum += rms; frames++;
     if (byButton) {
       if (!buttonPressed()) break;
       voicedMs += 20;
     } else {
       if (rms > thr * 0.7f) { silentMs = 0; voicedMs += 20; }
       else silentMs += 20;
-      if (silentMs >= VAD_SILENCE_MS) break;
+      if (silentMs >= VAD_SILENCE_MS) { lastRecHitMax = false; break; }
     }
   }
+  if (byButton) lastRecHitMax = false;
+  lastRecAvgRms = frames ? rmsSum / frames : 0;
   micLevel = 0;
   if (!byButton) {
     // 去掉尾端靜音（保留 200ms）
@@ -1005,6 +1099,191 @@ bool speak(const String &text) {
 }
 
 // ============================================================================
+//  唱歌：從 YouTube 播放清單隨機選歌
+// ============================================================================
+// 邊下載邊解析播放清單網頁（約 1MB，不整頁存下來）：找 lockupViewModel → videoId → title
+class PlaylistParser : public Stream {
+ public:
+  std::vector<Song> out;
+  size_t write(uint8_t b) override { feed(b); return 1; }
+  size_t write(const uint8_t *d, size_t n) override { for (size_t i = 0; i < n; i++) feed(d[i]); return n; }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+ private:
+  int state = 0, mi = 0;
+  bool esc = false;
+  String buf, vid;
+  void feed(uint8_t c) {
+    static const char *M[] = {"\"lockupViewModel\":{\"contentImage\"", "\"videoId\":\"", "\"title\":{\"content\":\""};
+    if (out.size() >= 80) return;
+    if (state == 0 || state == 1 || state == 3) {
+      const char *pat = M[state == 0 ? 0 : state == 1 ? 1 : 2];
+      if (c == (uint8_t)pat[mi]) mi++;
+      else mi = (c == (uint8_t)pat[0]) ? 1 : 0;
+      if (pat[mi] == 0) { mi = 0; buf = ""; esc = false; state = state == 0 ? 1 : state == 1 ? 2 : 4; }
+    } else if (state == 2) {
+      buf += (char)c;
+      if (buf.length() == 11) { vid = buf; state = 3; }
+    } else if (state == 4) {
+      if (c == '"' && !esc) { out.push_back({vid, unescape(buf)}); state = 0; }
+      else { esc = (c == '\\' && !esc); buf += (char)c; }
+      if (buf.length() > 300) state = 0;
+    }
+  }
+  static String unescape(const String &s) {
+    String r;
+    for (size_t i = 0; i < s.length(); i++) {
+      if (s[i] == '\\' && i + 1 < s.length()) {
+        char n = s[++i];
+        if (n == 'u' && i + 4 < s.length()) {                    // \uXXXX → UTF-8
+          uint32_t cp = strtoul(s.substring(i + 1, i + 5).c_str(), nullptr, 16);
+          i += 4;
+          if (cp < 0x80) r += (char)cp;
+          else if (cp < 0x800) { r += (char)(0xC0 | (cp >> 6)); r += (char)(0x80 | (cp & 0x3F)); }
+          else { r += (char)(0xE0 | (cp >> 12)); r += (char)(0x80 | ((cp >> 6) & 0x3F)); r += (char)(0x80 | (cp & 0x3F)); }
+        } else r += n == 'n' ? ' ' : n;
+      } else r += s[i];
+    }
+    return r;
+  }
+};
+
+void loadSongsFromNvs() {
+  prefs.begin("robot", true);
+  String raw = prefs.getString("songs", "");
+  prefs.end();
+  std::vector<Song> v;
+  int start = 0;
+  while (start < (int)raw.length()) {
+    int nl = raw.indexOf('\n', start);
+    if (nl < 0) nl = raw.length();
+    String line = raw.substring(start, nl);
+    int tab = line.indexOf('\t');
+    if (tab == 11) v.push_back({line.substring(0, 11), line.substring(12)});
+    start = nl + 1;
+  }
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  songs = v;
+  xSemaphoreGive(songLock);
+}
+
+// 下載播放清單並存進 NVS；回傳歌曲數（失敗 -1）
+int refreshPlaylist() {
+  if (cfg.playlist.indexOf("list=") < 0) return -1;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, cfg.playlist);
+  http.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36");
+  http.addHeader("Accept-Language", "zh-TW,zh;q=0.9");
+  int code = http.GET();
+  if (code != 200) { http.end(); Serial.printf("歌單下載失敗 %d\n", code); return -1; }
+  PlaylistParser parser;
+  http.writeToStream(&parser);
+  http.end();
+  if (parser.out.empty()) { Serial.println("歌單解析不到歌曲"); return -1; }
+  String raw;
+  for (auto &x : parser.out) raw += x.id + "\t" + x.title + "\n";
+  prefs.begin("robot", false);
+  prefs.putString("songs", raw);
+  prefs.end();
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  songs = parser.out;
+  xSemaphoreGive(songLock);
+  Serial.printf("歌單更新：%d 首\n", (int)parser.out.size());
+  return parser.out.size();
+}
+
+void playlistTask(void *) {
+  refreshPlaylist();
+  vTaskDelete(nullptr);
+}
+
+// 下載 YouTube 封面（mqdefault 320x180）並解碼
+bool fetchThumb(const String &id) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setTimeout(10000);
+  http.begin(client, "https://i.ytimg.com/vi/" + id + "/mqdefault.jpg");
+  int code = http.GET();
+  bool ok = false;
+  if (code == 200) {
+    const size_t CAP = 64 * 1024;
+    uint8_t *jpg = (uint8_t *)ps_malloc(CAP);
+    size_t len = 0;
+    WiFiClient *st = http.getStreamPtr();
+    uint32_t t0 = millis();
+    int total = http.getSize();
+    while (http.connected() && len < CAP && (total < 0 || (int)len < total) && millis() - t0 < 8000) {
+      size_t a = st->available();
+      if (a) len += st->readBytes(jpg + len, min(a, CAP - len));
+      else delay(5);
+    }
+    if (jpg && len > 0 && jpg2rgb565(jpg, len, (uint8_t *)thumbPix, JPG_SCALE_NONE)) {
+      ok = true;
+    }
+    free(jpg);
+  }
+  http.end();
+  return ok;
+}
+
+void qrCapture(esp_qrcode_handle_t q) {
+  int n = esp_qrcode_get_size(q);
+  if (n > 45) return;
+  for (int y = 0; y < n; y++)
+    for (int x = 0; x < n; x++) qrMods[y * n + x] = esp_qrcode_get_module(q, x, y);
+  qrSize = n;
+}
+
+uint32_t songSince = 0;
+int lastSong = -1;
+
+void singSong() {
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  int n = songs.size();
+  Song s;
+  if (n) {
+    int i = random(n);
+    if (n > 1) while (i == lastSong) i = random(n);
+    lastSong = i;
+    s = songs[i];
+  }
+  xSemaphoreGive(songLock);
+  if (!n) {
+    speakExpr = EX_SAD;
+    speakAndShow("我的歌單還是空的，請到設定網頁填入 YouTube 播放清單網址，再按更新歌單喔。");
+    return;
+  }
+  Serial.println("唱歌：" + s.title + " https://youtu.be/" + s.id);
+  setUi(UI_THINK, "選歌中…", "《" + s.title + "》");
+  thumbOk = fetchThumb(s.id);
+  qrSize = 0;
+  esp_qrcode_config_t qc = {};
+  qc.display_func = qrCapture;
+  qc.max_qrcode_version = 7;
+  qc.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  esp_qrcode_generate(&qc, ("https://youtu.be/" + s.id).c_str());
+  setUi(UI_SONG, s.title, s.id);
+  songSince = millis();
+  if (speak("我來唱《" + s.title + "》給你聽！這是" SONG_COMPOSER "創作的歌，用手機掃描 QR 碼，就能在 YouTube 聽完整版喔！"))
+    waitPlaybackDone();
+  songSince = millis();
+  lastInteraction = millis();
+}
+
+void exitSong() {
+  setUi(UI_IDLE);
+  flushMic(200);
+  lastInteraction = millis();
+}
+
+// ============================================================================
 //  一次完整對話
 // ============================================================================
 bool containsAny(const String &s, std::initializer_list<const char *> words) {
@@ -1037,6 +1316,7 @@ void handleUtterance(size_t samples) {
   String userText = speechToText(samples);
   if (userText.isEmpty() || isNoiseTranscript(userText)) {
     if (lastApiError.length()) showError(lastApiError);
+    else raiseNoiseFloor(lastRecAvgRms * 0.7f);
     Serial.println("（忽略：" + userText + "）");
     return;
   }
@@ -1044,8 +1324,16 @@ void handleUtterance(size_t samples) {
   lastInteraction = millis();
 
   // 2) 本地指令
+  if (containsAny(userText, {"唱歌", "唱首歌", "唱一首", "唱個歌", "來首歌", "來一首", "放歌", "聽歌", "播歌", "放首歌"})) {
+    singSong();
+    return;
+  }
   String reply;
-  if (containsAny(userText, {"大聲", "音量調大", "音量大一點"})) {
+  if (containsAny(userText, {"更新歌單"})) {
+    setUi(UI_THINK, "更新歌單中…", "");
+    int cnt = refreshPlaylist();
+    reply = cnt > 0 ? "歌單更新好了，一共有" + String(cnt) + "首歌！" : "歌單更新失敗，請檢查播放清單網址。";
+  } else if (containsAny(userText, {"大聲", "音量調大", "音量大一點"})) {
     volumePct = min(100, volumePct + 20);
     saveVolume();
     reply = "好的，音量調到百分之" + String(volumePct) + "。";
@@ -1117,6 +1405,10 @@ void handleStatus() {
   d["ssid"] = cfg.ssid;
   d["hasPass"] = cfg.pass.length() > 0;
   d["apiKey"] = maskKey(cfg.apiKey);
+  d["playlist"] = cfg.playlist;
+  xSemaphoreTake(songLock, portMAX_DELAY);
+  d["songs"] = (int)songs.size();
+  xSemaphoreGive(songLock);
   d["ip"] = portalMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
   d["rssi"] = portalMode ? 0 : WiFi.RSSI();
   String out;
@@ -1152,14 +1444,15 @@ void handleScan() {
 }
 
 void handleSave() {
-  String ssid = server.arg("ssid"), pass = server.arg("pass"), key = server.arg("apikey");
-  ssid.trim(); key.trim();
+  String ssid = server.arg("ssid"), pass = server.arg("pass"), key = server.arg("apikey"), pl = server.arg("playlist");
+  ssid.trim(); key.trim(); pl.trim();
   if (ssid.isEmpty()) { server.send(400, "text/plain; charset=utf-8", "請選擇 Wi-Fi"); return; }
   prefs.begin("robot", false);
   // 密碼空白：同一個網路 = 不變更；換了網路 = 無密碼網路
   prefs.putString("pass", pass.length() || ssid != cfg.ssid ? pass : cfg.pass);
   prefs.putString("ssid", ssid);
   prefs.putString("apikey", key.length() ? key : cfg.apiKey);
+  if (pl != cfg.playlist) { prefs.putString("playlist", pl); prefs.remove("songs"); }
   prefs.end();
   server.send(200, "text/plain; charset=utf-8", "ok");
   Serial.println("設定已儲存，重新啟動");
@@ -1184,6 +1477,10 @@ void startWebServer() {
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/scan", HTTP_GET, handleScan);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/refresh", HTTP_POST, [] {
+    int n = refreshPlaylist();
+    server.send(n > 0 ? 200 : 500, "text/plain; charset=utf-8", n > 0 ? String(n) : String("更新失敗"));
+  });
   server.onNotFound([] {                               // 設定模式下所有網址都導向設定頁（手機會自動跳出）
     if (portalMode) { server.sendHeader("Location", "http://192.168.4.1/"); server.send(302, "text/plain", ""); }
     else server.send(404, "text/plain", "not found");
@@ -1291,6 +1588,8 @@ void setup() {
   }
   wavBuf = (uint8_t *)ps_malloc(44 + MAX_SAMPLES * 2);
   tts.buf = (uint8_t *)ps_malloc(TTS_BUF_BYTES);
+  thumbPix = (uint16_t *)ps_malloc(320 * 180 * 2);
+  songLock = xSemaphoreCreateMutex();
 
   bool audioOK = initAudio();
   xTaskCreatePinnedToCore(playTask, "play", 4096, nullptr, 5, &playTaskHandle, 1);
@@ -1310,7 +1609,9 @@ void setup() {
 
   if (!audioOK) showError("I2S 初始化失敗，請檢查 config.h 的麥克風/擴大機腳位");
   loadSettings();
+  loadSongsFromNvs();
   connectWiFi(true);
+  xTaskCreatePinnedToCore(playlistTask, "playlist", 8192, nullptr, 1, nullptr, 1);   // 背景更新歌單
   if (cfg.apiKey.isEmpty()) {
     setUi(UI_MSG, "尚未設定 API Key", String("請用手機或電腦開啟\n") + ipText + "\n輸入 OpenAI API Key");
     while (true) delay(1000);
@@ -1370,8 +1671,33 @@ void loop() {
   if (VOICE_ACTIVATION) {                                   // 聲控模式：按鍵用來看功能說明
     static bool btnPrev = false;
     bool btn = buttonPressed();
-    if (btn && !btnPrev) { delay(30); if (buttonPressed()) onHelpButton(); }
+    if (btn && !btnPrev) {
+      delay(30);
+      if (buttonPressed()) {
+        if (uiState == UI_SONG) exitSong();
+        else if (uiState == UI_HELP) onHelpButton();
+        else {
+          uint32_t t0 = millis();                          // 短按 = 功能說明；按住 = 說話（環境吵時用）
+          while (buttonPressed() && millis() - t0 < 400) delay(10);
+          if (buttonPressed()) {
+            Serial.println("（按住說話）");
+            size_t n = recordUtterance(true);
+            if (n) handleUtterance(n);
+            flushMic(300);
+            if (uiState != UI_SONG) setUi(UI_IDLE);
+            btnPrev = false;
+            return;
+          }
+          onHelpButton();
+        }
+      }
+    }
     btnPrev = buttonPressed();
+    if (uiState == UI_SONG) {                               // 唱歌畫面：暫停聲控（手機正在放歌），時間到回到聊天
+      if (millis() - songSince > SONG_SHOW_SEC * 1000UL) exitSong();
+      delay(20);
+      return;
+    }
     if (uiState == UI_HELP) {                               // 看說明時暫停聲控，90 秒沒動作自動回到聊天
       if (millis() - helpSince > 90000) exitHelp();
       delay(20);
@@ -1404,9 +1730,14 @@ void loop() {
   if (trigger) {
     loudFrames = 0;
     size_t n = recordUtterance(byButton);
+    if (n && lastRecHitMax) {
+      Serial.println("（一直沒有停頓，可能是音樂或噪音，不送出）");
+      raiseNoiseFloor(lastRecAvgRms * 0.9f);
+      n = 0;
+    }
     if (n) handleUtterance(n);
     else Serial.println("（太短，視為雜音）");
     flushMic(300);
-    setUi(UI_IDLE);
+    if (uiState != UI_SONG) setUi(UI_IDLE);             // 唱歌畫面要留著
   }
 }
