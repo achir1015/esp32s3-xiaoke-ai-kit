@@ -1,6 +1,7 @@
 # 小柯 AI 聊天機器人（OpenAI 版）— AI 聊天機器人組合套件 ESP32-S3 N16R8
 <img width="1430" height="887" alt="image" src="https://github.com/user-attachments/assets/140f8a41-815d-4f62-8131-7e82ccfe9064" />
 <img width="1047" height="891" alt="image" src="https://github.com/user-attachments/assets/a6753c2d-1135-4613-8963-04535b35088b" />
+<img width="527" height="339" alt="image" src="https://github.com/user-attachments/assets/eb19b21e-4c18-4f95-90fb-6d01344fa6c1" />
 <img width="608" height="507" alt="image" src="https://github.com/user-attachments/assets/ed6b05c6-da62-4316-bba7-63962e7409be" />
 <img width="1477" height="1108" alt="image" src="https://github.com/user-attachments/assets/8af6c2c5-f7db-4135-867d-3219753b5bad" />
 
