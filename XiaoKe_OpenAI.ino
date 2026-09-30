@@ -476,8 +476,9 @@ void buildHelp() {
     {"5. 時間：上方顯示日期、星期、農曆與時間，也可以問「今天農曆幾號」。", C_WHITE},
     {"6. 網頁設定：開啟螢幕左下角的網址，可修改 Wi-Fi、密碼與 API Key。", C_WHITE},
     {"7. 連不上 Wi-Fi 時會開熱點 XiaoKe-Setup（密碼 xiaoke123），手機連上後開 192.168.4.1 設定。", C_WHITE},
-    {"8. 唱歌：說「唱首歌」，從" SONG_COMPOSER "的 YouTube 創作歌單隨機選一首，手機掃 QR 碼就能播放。", C_WHITE},
-    {"9. 喚醒鍵（BOOT）：短按看本說明（看完最後一頁回到聊天）；環境吵雜時「按住說話，放開送出」。", C_WHITE},
+    {"8. 上網查詢：問天氣、新聞、股價、比賽結果等即時資訊，" ROBOT_NAME "會先上網搜尋再回答。", C_WHITE},
+    {"9. 唱歌：說「唱首歌」，從" SONG_COMPOSER "的 YouTube 創作歌單隨機選一首，手機掃 QR 碼就能播放。", C_WHITE},
+    {"10. 喚醒鍵（BOOT）：短按看本說明（看完最後一頁回到聊天）；環境吵雜時「按住說話，放開送出」。", C_WHITE},
     {"\f", 0},
     {"二、創意開發者", C_YELLOW},
     {"", C_WHITE},
@@ -993,18 +994,57 @@ int parseEmotion(String &reply) {
   return e;
 }
 
+// 網路搜尋的回答會附上來源連結，例如「 ([nownews.com](https://…))」，語音播放前拿掉
+String stripLinks(String t) {
+  for (;;) {                                           // Markdown 連結 [文字](網址)
+    int a = t.indexOf('[');
+    if (a < 0) break;
+    int m = t.indexOf("](", a);
+    int b = m < 0 ? -1 : t.indexOf(')', m);
+    if (b < 0) break;
+    int from = a, to = b + 1;
+    if (from > 0 && t[from - 1] == '(' && to < (int)t.length() && t[to] == ')') { from--; to++; }   // 外層括號
+    while (from > 0 && t[from - 1] == ' ') from--;
+    t.remove(from, to - from);
+  }
+  for (int h; (h = t.indexOf("http")) >= 0;) {         // 剩下的裸網址
+    int e = h;
+    while (e < (int)t.length() && (uint8_t)t[e] > ' ' && (uint8_t)t[e] < 0x80) e++;
+    t.remove(h, e - h);
+  }
+  t.replace("\n\n", "\n");
+  return t;
+}
+
+// 問題看起來需要即時資訊（只用來顯示「上網查詢中」，要不要搜尋由 AI 自己決定）
+bool looksLikeSearch(const String &t) {
+  return containsAny(t, {"天氣", "氣溫", "下雨", "颱風", "新聞", "最新", "股價", "股票", "匯率", "比賽", "比數", "賽程",
+                         "查一下", "查查", "搜尋", "上網", "油價", "地震", "空氣品質", "營業時間"});
+}
+
+// 使用 OpenAI Responses API；ENABLE_WEB_SEARCH = 1 時 AI 可以自己決定上網搜尋（天氣、新聞…）
 String chatWithGPT(const String &userText) {
   JsonDocument doc;
   doc["model"] = CHAT_MODEL;
-  doc["max_tokens"] = CHAT_MAX_TOKENS;
-  JsonArray msgs = doc["messages"].to<JsonArray>();
+  doc["max_output_tokens"] = CHAT_MAX_TOKENS;
+#if ENABLE_WEB_SEARCH
+  JsonObject ws = doc["tools"].to<JsonArray>().add<JsonObject>();
+  ws["type"] = "web_search";
+  ws["search_context_size"] = "low";
+  ws["user_location"]["type"] = "approximate";
+  ws["user_location"]["country"] = "TW";
+  ws["user_location"]["city"] = SEARCH_CITY;
+#endif
+  JsonArray msgs = doc["input"].to<JsonArray>();
 
-  JsonObject sys = msgs.add<JsonObject>();
-  sys["role"] = "system";
-  sys["content"] = String("你是一台可愛的桌上型 AI 語音機器人，名字叫「" ROBOT_NAME "」，個性活潑、貼心又有點俏皮。") +
+  doc["instructions"] = String("你是一台可愛的桌上型 AI 語音機器人，名字叫「" ROBOT_NAME "」，個性活潑、貼心又有點俏皮。") +
                    "一律使用台灣繁體中文回答，口語化、簡短（100 字以內），因為回答會用語音播放，"
                    "不要使用 Markdown、條列符號、表情符號或網址。"
                    "你沒有鏡頭，看不到東西；被要求看東西時，請可愛地說明你只能用聽的。"
+#if ENABLE_WEB_SEARCH
+                   "遇到天氣、新聞、股價、比賽結果等需要即時資訊的問題，請先上網搜尋，再用口語簡短摘要重點，"
+                   "不要唸出網址或來源網站名稱；沒指定地點時以" SEARCH_CITY_ZH "為準。"
+#endif
                    "語音辨識偶爾會聽錯字，請依上下文推測使用者的意思。"
                    "你的創意開發者是吳玉柱先生，他與 Claude AI 共同開發了你；"
                    "被問到是誰做的、開發者、作者或設計者時，要熱情地介紹吳玉柱先生，"
@@ -1031,7 +1071,7 @@ String chatWithGPT(const String &userText) {
   client.setInsecure();
   HTTPClient http;
   http.setTimeout(45000);
-  http.begin(client, String(OPENAI_HOST) + "/v1/chat/completions");
+  http.begin(client, String(OPENAI_HOST) + "/v1/responses");
   http.addHeader("Authorization", authHeader());
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(req);
@@ -1044,11 +1084,23 @@ String chatWithGPT(const String &userText) {
     Serial.println(lastApiError);
     return "";
   }
+  // output 可能是 [web_search_call, message]，取 message 的文字
   JsonDocument filter;
-  filter["choices"][0]["message"]["content"] = true;
+  filter["output"][0]["type"] = true;
+  filter["output"][0]["content"][0]["text"] = true;
   JsonDocument r;
   deserializeJson(r, resp, DeserializationOption::Filter(filter));
-  String reply = r["choices"][0]["message"]["content"] | "";
+  resp = String();
+  String reply;
+  bool searched = false;
+  for (JsonObject o : r["output"].as<JsonArray>()) {
+    String type = o["type"] | "";
+    if (type == "web_search_call") searched = true;
+    if (type == "message")
+      for (JsonObject c : o["content"].as<JsonArray>()) reply += c["text"] | "";
+  }
+  if (searched) Serial.println("（已上網搜尋）");
+  reply = stripLinks(reply);
   reply.replace("*", "");
   reply.replace("#", "");
   reply.trim();
@@ -1350,7 +1402,7 @@ void handleUtterance(size_t samples) {
 
   // 3) 問 GPT
   if (reply.isEmpty()) {
-    setUi(UI_THINK, "思考中…", "你：" + userText);
+    setUi(UI_THINK, ENABLE_WEB_SEARCH && looksLikeSearch(userText) ? "上網查詢中…" : "思考中…", "你：" + userText);
     reply = chatWithGPT(userText);
     if (reply.isEmpty()) {
       showError(lastApiError.length() ? lastApiError : "AI 沒有回應");

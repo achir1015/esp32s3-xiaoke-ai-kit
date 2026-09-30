@@ -22,6 +22,12 @@
 #define MAX_HISTORY_MSGS 10        // 記住最近幾則對話（user+assistant 各算 1 則）
 #define CHAT_MAX_TOKENS  300
 
+// ------------------------------------------------------------ 上網搜尋 ----
+// 1 = 問天氣、新聞、股價等即時資訊時，AI 會自己決定上網搜尋再回答（OpenAI web_search，搜尋會另外計費）
+#define ENABLE_WEB_SEARCH 1
+#define SEARCH_CITY       "Taipei"   // 搜尋預設地區（英文城市名）
+#define SEARCH_CITY_ZH    "台北"     // 沒講地點時以這裡為準
+
 // ------------------------------------------------------------- 功能開關 ----
 #define HW_TEST_MODE    0          // 1 = 開機只跑硬體測試（螢幕/喇叭/麥克風/按鍵），先確認接線用
 
