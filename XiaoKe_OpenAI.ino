@@ -183,10 +183,14 @@ volatile bool thumbOk = false;
 uint8_t qrMods[45 * 45];           // QR 碼模組（最多 version 7 = 45x45）
 volatile int qrSize = 0;
 
+extern volatile int speakExpr;
 void setUi(UiState s, const String &title = "", const String &text = "", bool sad = false) {
   xSemaphoreTake(uiLock, portMAX_DELAY);
   uiState = s; uiTitle = title; uiText = text; uiSad = sad; uiSince = millis();
   xSemaphoreGive(uiLock);
+  // 7 吋串口屏聯動：HMI:<狀態>,<表情>,<YouTube id>（筆電 hmi_relay.py 轉送給螢幕）
+  static const char *const UI_NAMES[] = {"IDLE", "LISTEN", "THINK", "SPEAK", "MSG", "HELP", "SONG"};
+  Serial.printf("HMI:%s,%d,%s\n", UI_NAMES[s], (int)speakExpr, s == UI_SONG ? text.c_str() : "");
 }
 
 // ------------------------------------------------------------------ 音訊 ----
@@ -1293,7 +1297,10 @@ void qrCapture(esp_qrcode_handle_t q) {
   qrSize = n;
 }
 
+#include "hmi_screen.h"   // 7 吋串口屏（GPIO17/18）
+
 uint32_t songSince = 0;
+uint32_t songShowMs = SONG_SHOW_SEC * 1000UL;
 int lastSong = -1;
 
 void singSong() {
@@ -1303,6 +1310,15 @@ void singSong() {
   if (n) {
     int i = random(n);
     if (n > 1) while (i == lastSong) i = random(n);
+#if HMI_ENABLE
+    if (hmi::ready) {                                   // 7 吋屏：優先唱有內建 MV 的歌
+      std::vector<int> cand;
+      for (int k = 0; k < n; k++)
+        if (hmi::mvIndex(songs[k].id) >= 0) cand.push_back(k);
+      if (cand.size() > 1) cand.erase(std::remove(cand.begin(), cand.end(), lastSong), cand.end());
+      if (!cand.empty()) i = cand[random(cand.size())];
+    }
+#endif
     lastSong = i;
     s = songs[i];
   }
@@ -1321,10 +1337,22 @@ void singSong() {
   qc.max_qrcode_version = 7;
   qc.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
   esp_qrcode_generate(&qc, ("https://youtu.be/" + s.id).c_str());
+  int mv = -1;
+#if HMI_ENABLE
+  if (hmi::ready) mv = hmi::mvIndex(s.id);
+#endif
   setUi(UI_SONG, s.title, s.id);
   songSince = millis();
-  if (speak("我來唱《" + s.title + "》給你聽！這是" SONG_COMPOSER "創作的歌，用手機掃描 QR 碼，就能在 YouTube 聽完整版喔！"))
-    waitPlaybackDone();
+  songShowMs = SONG_SHOW_SEC * 1000UL;
+  String intro = mv >= 0 ? "我來唱《" + s.title + "》給你聽！這是" SONG_COMPOSER "創作的歌，請看大螢幕喔！"
+                         : "我來唱《" + s.title + "》給你聽！這是" SONG_COMPOSER "創作的歌，用手機掃描 QR 碼，就能在 YouTube 聽完整版喔！";
+  if (speak(intro)) waitPlaybackDone();
+#if HMI_ENABLE
+  if (mv >= 0) {                                        // 7 吋屏播 MV，播完自動回到聊天
+    hmi::mvStart(mv);
+    songShowMs = (hmi::MVS[mv].sec + 3) * 1000UL;
+  }
+#endif
   songSince = millis();
   lastInteraction = millis();
 }
@@ -1658,6 +1686,9 @@ void setup() {
   lastInteraction = millis();
   buildHelp();
   xTaskCreatePinnedToCore(uiTask, "ui", 8192, nullptr, 1, nullptr, 0);
+#if HMI_ENABLE
+  hmi::start();                                   // 7 吋串口屏大臉
+#endif
 
   if (!audioOK) showError("I2S 初始化失敗，請檢查 config.h 的麥克風/擴大機腳位");
   loadSettings();
@@ -1719,6 +1750,16 @@ void loop() {
 #endif
   pollVolumeButton();
   if (WiFi.status() != WL_CONNECTED) connectWiFi(false);
+#if HMI_ENABLE
+  if (hmi::wantStopSong) {                                // 7 吋屏：MV 播放中點螢幕
+    hmi::wantStopSong = false;
+    if (uiState == UI_SONG) exitSong();
+  }
+  if (hmi::wantSong) {                                    // 7 吋屏選單：唱首歌
+    hmi::wantSong = false;
+    if (uiState != UI_SONG) { singSong(); return; }
+  }
+#endif
 
   if (VOICE_ACTIVATION) {                                   // 聲控模式：按鍵用來看功能說明
     static bool btnPrev = false;
@@ -1746,7 +1787,7 @@ void loop() {
     }
     btnPrev = buttonPressed();
     if (uiState == UI_SONG) {                               // 唱歌畫面：暫停聲控（手機正在放歌），時間到回到聊天
-      if (millis() - songSince > SONG_SHOW_SEC * 1000UL) exitSong();
+      if (millis() - songSince > songShowMs) exitSong();
       delay(20);
       return;
     }
